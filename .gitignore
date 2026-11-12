@@ -1,0 +1,40 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+node_modules/
+dist/
+playwright-report/
+test-results/
+.secrets/
+
+# Local credentials and cryptographic material
+.env
+.env.*
+!.env.example
+!.env.sample
+*.env
+*.enc
+*.key
+*.pem
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
+
+# Local databases, logs, and collected CNPJ data
+#*.db
+#*.db-*
+#*.sqlite
+#*.sqlite-*
+#*.sqlite3
+#*.sqlite3-*
+*.log
+utils/cnpj_*.checkpoint.json
+utils/cnpj_*.enriquecido.jsonl
