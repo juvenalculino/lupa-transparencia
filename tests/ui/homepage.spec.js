@@ -45,6 +45,84 @@ test("recarrega a tela inicial sem erros de renderização", async ({ page }) =>
   expect(pageErrors).toEqual([]);
 });
 
+test("filtra os gráficos por programa e mês e identifica cada série", async ({ page }) => {
+  const consultas = [];
+  const dadosExemplo = [
+    {
+      programa: "Auxilio Brasil (sacado)",
+      ano: 2023,
+      mes: 2,
+      mes_num: 2,
+      valor: 600,
+      beneficiados: 1,
+    },
+    {
+      programa: "Garantia Safra",
+      ano: 2023,
+      mes: 2,
+      mes_num: 2,
+      valor: 500,
+      beneficiados: 1,
+    },
+  ];
+
+  await page.route("**/api/**", async route => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/municipios") {
+      await route.fulfill({
+        json: {
+          municipios: [{ codigo_ibge: "2910750", nome: "Fátima", uf: "BA" }],
+          ufs: ["BA"],
+        },
+      });
+    } else if (url.pathname === "/api/filtros") {
+      await route.fulfill({
+        json: { programas: ["Auxilio Brasil (sacado)", "Garantia Safra"] },
+      });
+    } else if (url.pathname === "/api/consultar") {
+      const consulta = route.request().postDataJSON();
+      consultas.push(consulta);
+      const dados = dadosExemplo.filter(item =>
+        (consulta.programa === "Todos"
+          || item.programa.replace(" (sacado)", "") === consulta.programa)
+        && (consulta.mes === "Todos" || String(item.mes).padStart(2, "0") === consulta.mes),
+      );
+      await route.fulfill({
+        json: { dados, registros: dados.length, total_paginas: 1 },
+      });
+    } else if (url.pathname === "/api/config/api-key") {
+      await route.fulfill({ json: { enabled: true, configured: false } });
+    } else {
+      await route.fulfill({ json: { status: null, nodes: [], edges: [] } });
+    }
+  });
+
+  await page.goto("/");
+  const legenda = page.getByRole("list", {
+    name: "Programas exibidos no gráfico",
+  });
+  await expect(legenda.getByText("Auxilio Brasil", { exact: true })).toBeVisible();
+  await expect(legenda.getByText("Garantia Safra", { exact: true })).toBeVisible();
+  await expect(
+    page.getByLabel("Programa do gráfico").locator('option[value="Auxilio Brasil"]'),
+  ).toHaveCount(1);
+  await expect(
+    page.getByLabel("Programa do gráfico").locator('option[value="Todos"]'),
+  ).toHaveText("Todos os programas");
+  await expect(
+    page.getByLabel("Mês do gráfico").locator('option[value="Todos"]'),
+  ).toHaveText("Todos os meses");
+
+  await page.getByLabel("Programa do gráfico").selectOption("Auxilio Brasil");
+  await page.getByLabel("Mês do gráfico").selectOption("02");
+  await expect.poll(() => consultas.at(-1)).toMatchObject({
+    programa: "Auxilio Brasil",
+    mes: "02",
+  });
+  await expect(legenda.getByText("Auxilio Brasil", { exact: true })).toBeVisible();
+  await expect(legenda.getByText("Garantia Safra", { exact: true })).toHaveCount(0);
+});
+
 test("apresenta a página About, fontes e informações LGPD", async ({ page }) => {
   await mockSuccessfulApi(page);
 
@@ -436,6 +514,12 @@ test("filtra a listagem de CNPJs e o PDF pelas situações escolhidas", async ({
           por_pagina: 50,
           total_paginas: 1,
           programas_disponiveis: ["BPC", "Auxilio Emergencial"],
+          programas_cadastrados: [
+            "Auxilio Brasil (sacado)",
+            "Auxilio Emergencial",
+            "BPC",
+            "Garantia Safra",
+          ],
           resultados: [{
             nome: "JOAO DA SILVA",
             cpf_mascarado: "***.123.456-**",
@@ -482,6 +566,12 @@ test("filtra a listagem de CNPJs e o PDF pelas situações escolhidas", async ({
   await expect(page.getByText("EMPRESA BAIXADA")).toHaveCount(2);
   await expect(page.getByText("EMPRESA ATIVA")).toHaveCount(0);
 
+  await expect(
+    page.getByLabel("Programa do benefício").locator('option[value="Garantia Safra"]'),
+  ).toHaveCount(1);
+  await expect(
+    page.getByLabel("Programa do benefício").locator('option[value="Auxilio Brasil"]'),
+  ).toHaveCount(1);
   await page.getByLabel("Programa do benefício").selectOption("BPC");
   await expect.poll(() => cruzamentoConsultado.at(-1)?.get("programa")).toBe("BPC");
   await expect(page.getByRole("cell", { name: "BPC", exact: true })).toBeVisible();

@@ -193,6 +193,49 @@ class CnpjDataTests(unittest.TestCase):
             ["22222222000122"],
         )
 
+    def test_filter_lists_local_programs_and_matches_sacado_alias(self):
+        salvar_registros_cnpj(
+            self.con,
+            [self._record(
+                "11111111000111", "João da Silva", "***123456**", "PF")],
+            "2910750",
+            "Fátima",
+            "BA",
+            "teste",
+        )
+        self.con.execute(
+            """
+            INSERT INTO beneficiario (
+                beneficio, mes_ano, codigo_ibge, nis, nome,
+                cpf_mascarado, valor
+            ) VALUES
+                ('Auxilio Brasil (sacado)', '202302', '2910750',
+                 '11111111111', 'JOAO DA SILVA', '***.123.456-**', 600),
+                ('Garantia Safra', '202302', '2910750',
+                 '44444444444', 'ANA COSTA', '***.987.654-**', 500)
+            """
+        )
+
+        resultado_auxilio = obter_cruzamento_beneficiarios_cnpj(
+            self.con, "2910750", programa="Auxilio Brasil")
+        resultado_garantia = obter_cruzamento_beneficiarios_cnpj(
+            self.con, "2910750", programa="Garantia Safra")
+
+        self.assertIn(
+            "Auxilio Brasil (sacado)",
+            resultado_auxilio["programas_cadastrados"],
+        )
+        self.assertIn(
+            "Garantia Safra",
+            resultado_garantia["programas_cadastrados"],
+        )
+        self.assertEqual(resultado_auxilio["beneficiarios_com_cnpj"], 1)
+        self.assertEqual(
+            resultado_auxilio["resultados"][0]["programas"],
+            ["Auxilio Brasil (sacado)"],
+        )
+        self.assertEqual(resultado_garantia["beneficiarios_com_cnpj"], 0)
+
     def test_pdf_endpoint_forwards_company_and_program_filters(self):
         records = [
             self._record(

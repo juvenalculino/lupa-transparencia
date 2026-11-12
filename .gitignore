@@ -10,6 +10,9 @@ wheels/
 .venv
 node_modules/
 dist/
+sistema_social/
+sistema_social.rar
+sistema_social.zip
 playwright-report/
 test-results/
 .secrets/

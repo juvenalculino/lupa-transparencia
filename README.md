@@ -1,8 +1,8 @@
 # Benefícios por Município
 
 Coleta dados do [Portal da Transparência](https://api.portaldatransparencia.gov.br/swagger-ui/index.html#/)
-(API de dados) e salva em SQLite. A interface principal é um painel React +
-FastAPI; há também uma versão alternativa em Streamlit.
+(API de dados) e salva em SQLite. A interface é um painel React servido por
+uma API FastAPI.
 
 ## O que faz
 
@@ -173,48 +173,6 @@ titulares não estão configurados no código e devem ser preenchidos pelo
 responsável pela implantação; o projeto não define a base legal nem um prazo
 automático de retenção.
 
-### Painel Streamlit
-
-```bash
-streamlit run app.py
-```
-
-1. Cole sua **chave da API** na barra lateral
-   (gerada em https://api.portaldatransparencia.gov.br — ela não é salva em arquivo).
-2. Escolha o que buscar (agregado mensal do ano ou adicionar beneficiários),
-   o programa e o estado. No campo **Buscar município**, digite parte do nome
-   ou o código IBGE; o seletor reúne todos os municípios do estado, sem uma
-   segunda lista duplicada.
-3. Em **Agregado mensal do ano**, selecione todos os meses ou escolha meses
-   específicos. Por padrão, ano e meses são limitados aos dados já salvos
-   para o programa e município selecionados. Marque **Incluir competências
-   ainda não salvas** para consultar outros períodos pela API.
-4. Em **Adicionar beneficiários**, escolha um mês ou o ano inteiro. Clique em
-   **Adicionar dados do programa** para ver as competências já registradas;
-   ano e meses disponíveis são filtrados pelo programa e município. Para
-   consultar novas competências, marque **Incluir competências ainda não
-   salvas**. A ação mostra um resumo e a tabela dos dados salvos.
-5. No painel municipal, abra **Famílias e beneficiários** para filtrar por
-   programa, ano, nome ou NIS. O Novo Bolsa Família é selecionado por padrão
-   quando há registros disponíveis.
-6. A tabela resume os pagamentos por titular/NIS e reúne todos os programas
-   encontrados para cada pessoa. No BPC, identifica titulares menores de 16
-   anos e mostra os dados do representante legal quando a API os fornece.
-   Para meses coletados antes dessa informação ser salva, marque
-   **Reconsultar meses já coletados** em **Adicionar beneficiários** para
-   atualizar os dados. A lista é paginada para manter a navegação rápida. A
-   API não informa a composição completa da família.
-7. O app valida a vigência do programa e evita coletar novamente meses já
-   incluídos no banco.
-8. Em **Grafo inteligente**, escolha entre ver NIS compartilhados por programa
-   ou buscar uma pessoa pelo nome/NIS para visualizar os programas registrados.
-   Opcionalmente, veja outras pessoas que aparecem nos mesmos programas; essa
-   coincidência não significa parentesco ou composição familiar.
-9. Use **Buscar beneficiário em qualquer programa** para pesquisar em todo o
-   histórico local do município selecionado. A busca mostra os programas e
-   competências de cada pessoa identificada, independentemente dos filtros
-   de programa e período escolhidos acima.
-
 ## Vigência dos programas
 
 O app sabe o período de cada programa e avisa antes de buscar à toa
@@ -268,9 +226,60 @@ permite requisições paralelas.
 - `beneficiario` — benefício, mês, município, NIS, nome, CPF mascarado, valor
 - `coleta_log` — histórico de cada coleta (páginas, registros, tempo)
 
-## Arquivos
+## Mapeamento do projeto
 
-- `app.py` — painel Streamlit
-- `coleta.py` — cliente da API + banco (reutilizável sem o Streamlit)
-- `dados/municipios.json`, `dados/estados.json` — IBGE de todos os municípios
-  (fonte: https://github.com/kelvins/municipios-brasileiros)
+### Arquitetura e fluxo de dados
+
+```text
+React + Vite (src/main.jsx)
+        │ chamadas HTTP /api
+        ▼
+FastAPI (api.py) ─────── Portal da Transparência
+        │                Casa dos Dados + BrasilAPI
+        ├── coleta.py ─── coleta, limites e persistência
+        ├── rede.py ───── buscas e grafos de benefícios
+        ├── cnpj_dados.py ─ empresas, sócios e cruzamentos
+        └── beneficios.db (SQLite)
+```
+
+O FastAPI serve o build do frontend em `dist/`. Em desenvolvimento, o Vite
+encaminha `/api` para o servidor FastAPI. As coletas externas gravam no SQLite;
+as telas consultam os dados locais e oferecem exportações.
+
+### Módulos principais
+
+- [`src/main.jsx`](src/main.jsx) — aplicação React e navegação: Visão Geral,
+  Tabela, Rede de Programas, Grafo de Pessoa, Busca Global, CNPJs, Gestão & API
+  Gov.br e About.
+- [`src/styles.css`](src/styles.css) — estilos do painel.
+- [`api.py`](api.py) — endpoints REST, consultas ao banco, status de coleta,
+  exportações e serviço do frontend. As rotas estão agrupadas em `/api/`:
+  consultas e municípios; grafos e busca; configuração local de chaves; e
+  operações de CNPJs.
+- [`coleta.py`](coleta.py) — cliente do Portal da Transparência, controle de
+  limites e tentativas, vigência de programas, schema SQLite e rotinas de
+  coleta de agregados e beneficiários.
+- [`rede.py`](rede.py) — pesquisa de pessoas, relações entre programas e
+  construção dos grafos apresentados pelo painel.
+- [`cnpj_dados.py`](cnpj_dados.py) — importação e persistência de empresas e
+  sócios, filtros, cruzamentos e grafo empresarial.
+- [`utils/cnpj_municipio.py`](utils/cnpj_municipio.py) — coleta e
+  enriquecimento de CNPJs por município.
+- [`relatorio_cnpj_pdf.py`](relatorio_cnpj_pdf.py) — geração do relatório PDF
+  de cruzamentos.
+- [`api_secrets.py`](api_secrets.py) e
+  [`configurar_segredos.py`](configurar_segredos.py) — armazenamento cifrado
+  das chaves da API e preparação do segredo do servidor.
+- [`dados/municipios.json`](dados/municipios.json) e
+  [`dados/estados.json`](dados/estados.json) — catálogo de municípios e UFs.
+
+### Dados, testes e execução
+
+- `beneficios.db` é o banco SQLite local. O schema e os índices são definidos
+  em `coleta.py`; os dados de benefícios, empresas, sócios e histórico de
+  coletas são mantidos nesse arquivo.
+- [`tests/`](tests/) contém testes Python da API, coleta, segredos, grafos e
+  CNPJs. [`tests/ui/`](tests/ui/) contém os testes end-to-end Playwright.
+- `requirements.txt` lista as dependências Python; `pyproject.toml` e
+  `uv.lock` definem o projeto Python. `package.json` e `package-lock.json`
+  definem o frontend; `vite.config.js` configura o proxy de desenvolvimento.

@@ -40,6 +40,14 @@ def _cpf_visivel(valor):
     return ""
 
 
+def _programa_filtro_key(programa):
+    programa = str(programa or "").strip()
+    sufixo = " (sacado)"
+    if programa.casefold().endswith(sufixo):
+        programa = programa[:-len(sufixo)].rstrip()
+    return programa.casefold()
+
+
 def _float_ou_nulo(valor):
     if valor is None or str(valor).strip() == "":
         return None
@@ -216,6 +224,20 @@ def obter_cruzamento_beneficiarios_cnpj(
     programa = (programa or "").strip()
     if programa.casefold() == "todos":
         programa = ""
+    programa_filtro = _programa_filtro_key(programa)
+    programas_cadastrados = [
+        row[0]
+        for row in con.execute(
+            """
+            SELECT DISTINCT beneficio
+            FROM beneficiario
+            WHERE codigo_ibge=? AND beneficio IS NOT NULL
+              AND trim(beneficio) != ''
+            ORDER BY beneficio COLLATE NOCASE
+            """,
+            (codigo_ibge,),
+        )
+    ]
 
     linhas_beneficiarios = con.execute(
         """
@@ -339,10 +361,10 @@ def obter_cruzamento_beneficiarios_cnpj(
         beneficios = resultado["beneficios"]
         programas_disponiveis.update(
             beneficio for beneficio, _, _ in beneficios)
-        if programa:
+        if programa_filtro:
             beneficios = {
                 beneficio for beneficio in beneficios
-                if beneficio[0] == programa
+                if _programa_filtro_key(beneficio[0]) == programa_filtro
             }
             if not beneficios:
                 continue
@@ -397,6 +419,7 @@ def obter_cruzamento_beneficiarios_cnpj(
         "socios": resumo[1],
         "beneficiarios_com_cnpj": total,
         "programas_disponiveis": sorted(programas_disponiveis),
+        "programas_cadastrados": programas_cadastrados,
         "coletado_em": coleta[0] if coleta else None,
         "origem": coleta[1] if coleta else None,
         "resultados": resultados,

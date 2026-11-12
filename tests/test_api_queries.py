@@ -114,6 +114,35 @@ class ApiQueryTests(unittest.TestCase):
         })
         self.assertEqual(dados[0]["valor"], 11_000)
         self.assertEqual(dados[1]["valor"], 700)
+        self.assertTrue(all(
+            item["programa"] == "Novo Bolsa Familia (sacado)"
+            for item in dados
+        ))
+
+    def test_beneficiary_summary_keeps_program_series_separate(self):
+        self.con.execute(
+            """
+            INSERT INTO beneficiario (
+                beneficio, mes_ano, codigo_ibge, nis, nome, valor
+            ) VALUES (
+                'BPC', '202501', '2910750', '00000000001',
+                'BENEFICIARIO 001', 200
+            )
+            """
+        )
+
+        dados, resumo = api.carregar_resumo_beneficiarios(
+            self.con, "Todos", "2025", "2910750", "Todos")
+
+        self.assertEqual(
+            [(item["programa"], item["valor"]) for item in dados],
+            [
+                ("BPC", 200),
+                ("Novo Bolsa Familia (sacado)", 11_000),
+            ],
+        )
+        self.assertEqual(resumo["total_valor"], 11_200)
+        self.assertEqual(resumo["total_beneficiados"], 110)
 
     def test_program_year_months_follow_the_supplied_vigence_ranges(self):
         self.assertEqual(meses_validos_ano("Novo Bolsa Familia", 2022), [])

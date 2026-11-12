@@ -107,6 +107,14 @@ const VIGENCIAS_BENEFICIOS = {
 const MESES_BENEFICIO = Array.from({ length: 12 }, (_, index) =>
   String(index + 1).padStart(2, "0"),
 );
+const NOMES_MESES = [
+  "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+  "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
+];
+const CORES_GRAFICO = [
+  "#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#06b6d4",
+  "#ef4444", "#84cc16", "#ec4899",
+];
 
 function obterAnosVigentes(programa) {
   const [inicio, fim] = VIGENCIAS_BENEFICIOS[programa] || ["199101", null];
@@ -733,7 +741,35 @@ function rotuloVigencia(programa) {
                 </div>
               )}
 
-              {activeTab === "dashboard" && <DashboardView dados={dados} resumo={metricasResumo} selectedMun={selectedMun} selectedPrograma={selectedPrograma} selectedAno={selectedAno} selectedMes={selectedMes} tipoConsulta={tipoConsulta} loading={loading} />}
+              {activeTab === "dashboard" && (
+                <DashboardView
+                  dados={dados}
+                  resumo={metricasResumo}
+                  selectedMun={selectedMun}
+                  selectedPrograma={selectedPrograma}
+                  selectedAno={selectedAno}
+                  selectedMes={selectedMes}
+                  tipoConsulta={tipoConsulta}
+                  loading={loading}
+                  programasDisponiveis={programasDisponiveis}
+                  mesesFiltro={mesesFiltro}
+                  onProgramaChange={programa => {
+                    setSelectedPrograma(programa);
+                    if (programa !== "Todos") {
+                      const periodo = ajustarPeriodoVigente(
+                        programa, selectedAno, selectedMes,
+                      );
+                      setSelectedAno(periodo.ano);
+                      setSelectedMes(periodo.mes);
+                    }
+                    setPagina(1);
+                  }}
+                  onMesChange={mes => {
+                    setSelectedMes(mes);
+                    setPagina(1);
+                  }}
+                />
+              )}
               {activeTab === "tabela" && <TabelaView dados={dados} loading={loading} tipoConsulta={tipoConsulta} onSelectPessoa={(nis) => { setNisGrafo(nis); setActiveTab("grafo_pessoa"); }} serverPagination={tipoConsulta === "Adicionar beneficiários"} pagina={pagina} totalPaginas={totalPaginas} totalRegistros={totalRegistros} onPageChange={setPagina} busca={buscaTabela} onSearch={(value) => { setBuscaTabela(value); setPagina(1); }} />}
               {activeTab === "grafo_programas" && <GrafoProgramasView selectedMun={selectedMun} selectedAno={selectedAno} apiUrl={API_URL} />}
               {activeTab === "grafo_pessoa" && <GrafoPessoaView nisGrafo={nisGrafo} setNisGrafo={setNisGrafo} selectedMun={selectedMun} selectedAno={selectedAno} apiUrl={API_URL} />}
@@ -904,9 +940,48 @@ function rotuloVigencia(programa) {
     }
 
     // --- DASHBOARD VIEW ---
-    function DashboardView({ dados, resumo, selectedMun, selectedPrograma, selectedAno, selectedMes, tipoConsulta, loading }) {
+    function DashboardView({
+      dados, resumo, selectedMun, selectedPrograma, selectedAno, selectedMes,
+      tipoConsulta, loading, programasDisponiveis, mesesFiltro,
+      onProgramaChange, onMesChange,
+    }) {
       const chartRef = useRef(null);
       const chartInstance = useRef(null);
+      const chartData = useMemo(() => {
+        const periodos = new Map();
+        const series = new Map();
+        for (const item of dados || []) {
+          const ano = Number.parseInt(item.ano, 10) || 0;
+          const mes = Number.parseInt(item.mes_num ?? item.mes, 10) || 0;
+          const mesLabel = String(mes).padStart(2, "0");
+          const periodKey = ano ? `${ano}-${mesLabel}` : mesLabel;
+          if (!periodos.has(periodKey)) {
+            periodos.set(periodKey, ano ? `${mesLabel}/${ano}` : mesLabel);
+          }
+
+          const programa = String(
+            item.programa || (selectedPrograma === "Todos" ? "Programa" : selectedPrograma),
+          ).replace(/\s+\(sacado\)$/i, "").trim();
+          if (!series.has(programa)) series.set(programa, new Map());
+          const valores = series.get(programa);
+          const valor = Number(item.valor ?? item.valor_saque) || 0;
+          valores.set(periodKey, (valores.get(periodKey) || 0) + valor);
+        }
+
+        const periodKeys = [...periodos.keys()].sort();
+        const labels = periodKeys.map(key => periodos.get(key));
+        const datasets = [...series.entries()]
+          .sort(([programaA], [programaB]) => programaA.localeCompare(programaB, "pt-BR"))
+          .map(([programa, valores], index) => ({
+            label: programa,
+            data: periodKeys.map(key => valores.get(key) || 0),
+            backgroundColor: CORES_GRAFICO[index % CORES_GRAFICO.length],
+            borderColor: CORES_GRAFICO[index % CORES_GRAFICO.length],
+            borderWidth: 1,
+            borderRadius: 6,
+          }));
+        return { labels, datasets };
+      }, [dados, selectedPrograma]);
 
       const metricas = useMemo(() => {
         if (resumo) {
@@ -933,53 +1008,25 @@ function rotuloVigencia(programa) {
       }, [dados, resumo, tipoConsulta]);
 
       useEffect(() => {
-        if (chartInstance.current) { 
-          chartInstance.current.destroy(); 
-          chartInstance.current = null; 
+        if (chartInstance.current) {
+          chartInstance.current.destroy();
+          chartInstance.current = null;
         }
-        if (!chartRef.current || !dados || dados.length === 0) return;
+        if (!chartRef.current || chartData.datasets.length === 0) return;
 
-        const ctx = chartRef.current.getContext('2d');
-        const agrupado = {};
-        
-        dados.forEach(item => {
-          const val = parseFloat(item.valor || item.valor_saque) || 0;
-          const ano = parseInt(item.ano) || 0;
-          const mesNum = parseInt(item.mes_num || item.mes) || 0;
-          
-          const label = ano ? `${String(mesNum).padStart(2,'0')}/${ano}` : String(mesNum).padStart(2,'0');
-          const sortKey = ano ? `${ano}-${String(mesNum).padStart(2, '0')}` : String(mesNum).padStart(2, '0');
-          
-          if (!agrupado[sortKey]) agrupado[sortKey] = { label, val: 0 };
-          agrupado[sortKey].val += val;
-        });
-
-        const sortedKeys = Object.keys(agrupado).sort();
-        const labels = sortedKeys.map(k => agrupado[k].label);
-        const valores = sortedKeys.map(k => agrupado[k].val);
-
-        chartInstance.current = new Chart(ctx, {
+        chartInstance.current = new Chart(chartRef.current.getContext("2d"), {
           type: 'bar',
-          data: {
-            labels: labels,
-            datasets: [{
-              label: 'Repasse Governamental (R$)',
-              data: valores,
-              backgroundColor: 'rgba(59, 130, 246, 0.7)',
-              borderColor: 'rgba(59, 130, 246, 1)',
-              borderWidth: 1, borderRadius: 6,
-            }]
-          },
+          data: chartData,
           options: {
             responsive: true, maintainAspectRatio: false,
-            plugins: { legend: { labels: { color: '#94a3b8' } } },
+            plugins: { legend: { display: false } },
             scales: { 
               x: { ticks: { color: '#94a3b8' }, grid: { color: '#1e293b' } }, 
               y: { ticks: { color: '#94a3b8' }, grid: { color: '#1e293b' } } 
             }
           }
         });
-      }, [dados, tipoConsulta]);
+      }, [chartData]);
 
       if (!selectedMun) return null;
 
@@ -993,6 +1040,38 @@ function rotuloVigencia(programa) {
                   {selectedMun.nome} - {selectedMun.uf} | Ano: {selectedAno} | Mês: {selectedMes}
                 </span>
               </h2>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full md:w-[28rem]">
+              <label className="flex flex-col gap-1 text-xs text-slate-300">
+                Programa dos gráficos
+                <select
+                  aria-label="Programa do gráfico"
+                  value={selectedPrograma}
+                  onChange={event => onProgramaChange(event.target.value)}
+                  className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-200"
+                >
+                  <option value="Todos">Todos os programas</option>
+                  {programasDisponiveis.map(programa => (
+                    <option key={programa} value={programa}>{programa}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-1 text-xs text-slate-300">
+                Mês dos gráficos
+                <select
+                  aria-label="Mês do gráfico"
+                  value={selectedMes}
+                  onChange={event => onMesChange(event.target.value)}
+                  className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-200"
+                >
+                  <option value="Todos">Todos os meses</option>
+                  {mesesFiltro.map(mes => (
+                    <option key={mes} value={mes}>
+                      {NOMES_MESES[Number(mes) - 1]}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
           </div>
 
@@ -1018,7 +1097,27 @@ function rotuloVigencia(programa) {
           </div>
 
           <div className="bg-slate-800 p-6 rounded-2xl border border-slate-700/70 h-[380px] shadow-lg relative flex flex-col">
-            <h3 className="text-sm font-semibold text-white mb-4">Evolução de Repasses (R$)</h3>
+            <h3 className="text-sm font-semibold text-white mb-2">Repasses por programa e competência (R$)</h3>
+            <div
+              role="list"
+              aria-label="Programas exibidos no gráfico"
+              className="flex flex-wrap gap-x-4 gap-y-1 mb-3"
+            >
+              {chartData.datasets.map(dataset => (
+                <span
+                  key={dataset.label}
+                  role="listitem"
+                  className="inline-flex items-center gap-1.5 text-[11px] text-slate-300"
+                >
+                  <span
+                    aria-hidden="true"
+                    className="w-2.5 h-2.5 rounded-sm"
+                    style={{ backgroundColor: dataset.backgroundColor }}
+                  />
+                  {dataset.label}
+                </span>
+              ))}
+            </div>
             {loading ? (
               <div className="flex-1 flex flex-col items-center justify-center text-brand-500">
                 <Icon name="loader-2" className="w-8 h-8 animate-spin mb-2" />
@@ -1734,7 +1833,8 @@ function rotuloVigencia(programa) {
         ? restantesEnriquecimento / ritmoEnriquecimento
         : null;
       const programasSociosDisponiveis = new Set(
-        data?.programas_disponiveis || [],
+        (data?.programas_cadastrados || data?.programas_disponiveis || [])
+          .map(programa => programa.replace(/\s+\(sacado\)$/i, "").trim()),
       );
       if (programaSocio) programasSociosDisponiveis.add(programaSocio);
 
@@ -2009,7 +2109,7 @@ function rotuloVigencia(programa) {
             <div className="p-5 border-b border-slate-700">
               <h3 className="font-bold text-white">Beneficiários que também constam como sócios</h3>
               <p className="text-xs text-slate-400 mt-1">
-                A lista segue os filtros de empresa aplicados acima. O capital social é o valor cadastrado para a empresa, não o patrimônio pessoal do beneficiário; os dados pessoais permanecem mascarados.
+                A lista segue os filtros de empresa aplicados acima. O seletor inclui os programas com registros locais, mesmo quando não há correspondência. O cruzamento exige nome normalizado e seis dígitos visíveis do CPF; o capital social é da empresa, não do beneficiário.
               </p>
               <label className="mt-4 flex max-w-sm flex-col gap-1 text-xs text-slate-300">
                 Programa do benefício
@@ -2049,7 +2149,11 @@ function rotuloVigencia(programa) {
                       <tr key={`${pessoa.cpf_mascarado}-${index}`} className="align-top text-slate-200">
                         <td className="p-3 font-medium">{pessoa.nome}</td>
                         <td className="p-3 font-mono text-slate-400">{pessoa.cpf_mascarado}</td>
-                        <td className="p-3 text-slate-300">{pessoa.programas.join(", ")}</td>
+                        <td className="p-3 text-slate-300">
+                          {pessoa.programas
+                            .map(programa => programa.replace(/\s+\(sacado\)$/i, "").trim())
+                            .join(", ")}
+                        </td>
                         <td className="p-3 space-y-2">
                           {pessoa.empresas.map(empresa => (
                             <div key={empresa.cnpj}>
@@ -2072,8 +2176,10 @@ function rotuloVigencia(programa) {
               </div>
             ) : (
               <p className="p-8 text-center text-sm text-slate-400">
-                {data?.empresas
-                  ? "Nenhuma correspondência forte encontrada para este município."
+                {data?.empresas && programaSocio
+                  ? `Nenhuma correspondência forte encontrada para ${programaSocio}. A opção aparece porque há registros locais; o cruzamento exige nome normalizado e seis dígitos visíveis do CPF.`
+                  : data?.empresas
+                    ? "Nenhuma correspondência forte encontrada para este município."
                   : "Ainda não há dados de CNPJ salvos para este município."}
               </p>
             )}

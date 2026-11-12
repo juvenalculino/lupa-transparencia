@@ -226,20 +226,22 @@ def carregar_resumo_beneficiarios(
     ).fetchone()
     rows = con.execute(
         f"""
-        SELECT mes_ano, COALESCE(SUM(valor), 0), COUNT(DISTINCT nis)
+        SELECT beneficio, mes_ano, COALESCE(SUM(valor), 0),
+               COUNT(DISTINCT nis)
         FROM beneficiario
         WHERE {where}
-        GROUP BY mes_ano
-        ORDER BY mes_ano
+        GROUP BY beneficio, mes_ano
+        ORDER BY mes_ano, beneficio
         """,
         parametros,
     ).fetchall()
 
     resultados = []
-    for mes_ano, valor, beneficiados in rows:
+    for beneficio, mes_ano, valor, beneficiados in rows:
         mes_ano = str(mes_ano)
         ano, mes = int(mes_ano[:4]), int(mes_ano[4:6])
         resultados.append({
+            "programa": beneficio,
             "mes": mes,
             "mes_num": mes,
             "ano": ano,
