@@ -41,3 +41,4 @@ service-account*.json
 *.log
 utils/cnpj_*.checkpoint.json
 utils/cnpj_*.enriquecido.jsonl
+implementacoes.md

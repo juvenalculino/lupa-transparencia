@@ -1,0 +1,931 @@
+#!/usr/bin/env python3
+"""Painel de beneficios do Portal da Transparencia — busca inteligente.
+
+Rode com:  streamlit run app.py
+
+Fluxo: escolhe programa + municipio + periodo, clica em Buscar.
+O app valida a vigencia do programa, usa o banco se os dados ja existirem
+e so acessa a API quando preciso. Resultado aparece na mesma tela.
+"""
+import os
+
+import pandas as pd
+import streamlit as st
+from streamlit_agraph import agraph, Node, Edge, Config
+
+from coleta import (
+    PROGRAMAS_AGREGADO, PROGRAMAS_BENEFICIARIO,
+    PortalClient, carregar_municipios,
+    coletar_agregado_ano, coletar_beneficiarios, fmt_mes, init_db,
+    meses_agregado_faltantes, meses_beneficiarios_faltantes,
+    meses_validos_ano, vigencia_programa,
+    rotulo_programa,
+)
+from rede import (
+    anos_beneficiarios, buscar_pessoas, criar_grafo_pessoa,
+    criar_grafo_programas, mascarar_nis, para_dot, programas_da_pessoa,
+    vizinhos_por_programas, calcular_metricas_grafo, format_metricas_para_exibicao,
+)
+
+st.set_page_config(page_title="Beneficios por Municipio", layout="wide")
+st.title("Beneficios por Municipio")
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+DB_PADRAO = os.path.join(BASE, "beneficios.db")
+
+MUNICIPIOS, UFS = carregar_municipios(os.path.join(BASE, "dados"))
+
+# ------------------------------------------------------------ sidebar ----
+st.sidebar.title("Configuracao")
+chave = st.sidebar.text_input("Chave da API do Portal", type="password",
+                              help="Nao fica salva em arquivo.")
+db_path = st.sidebar.text_input("Banco SQLite", DB_PADRAO)
+con = init_db(db_path)
+st.sidebar.caption("Limites da API: 700 req/min (00h-05h59), "
+                   "400 req/min (06h-23h59), 180 req/min em endpoints "
+                   "restritos. O app usa 95% do limite em horário de Brasília.")
+
+# ------------------------------------------------------------ filtros ----
+st.subheader("O que buscar")
+tipo = st.radio("Tipo de consulta",
+                ["Agregado mensal do ano", "Adicionar beneficiários"],
+                horizontal=True, key="tipo", label_visibility="collapsed")
+
+programas = (PROGRAMAS_AGREGADO if tipo == "Agregado mensal do ano"
+             else PROGRAMAS_BENEFICIARIO)
+rotulos = {rotulo_programa(p): p for p in programas}
+rotulo = st.selectbox("Programa", list(rotulos))
+beneficio = rotulos[rotulo]
+ini, fim = vigencia_programa(beneficio)
+st.caption(f"Vigencia do programa: {fmt_mes(ini)} a "
+           f"{fmt_mes(fim) if fim else 'atual'}")
+
+c1, c2 = st.columns(2)
+with c1:
+    uf = st.selectbox("Estado", UFS, key="uf")
+    municipios_estado = [m for m in MUNICIPIOS if m["uf"] == uf]
+    municipios_por_codigo = {m["codigo_ibge"]: m for m in municipios_estado}
+    codigo_municipio = st.selectbox(
+        "Buscar município",
+        options=list(municipios_por_codigo),
+        index=None,
+        placeholder="Digite o nome ou código IBGE...",
+        format_func=lambda codigo: (
+            f'{municipios_por_codigo[codigo]["nome"]} ({codigo})'),
+        key=f"municipio_{uf}",
+    )
+    mun = municipios_por_codigo.get(codigo_municipio)
+    st.caption(f"{len(municipios_estado)} municípios disponíveis em {uf}.")
+with c2:
+    ano = st.number_input("Ano", min_value=2000, max_value=2100, value=2025,
+                          step=1, key="ano")
+    meses_validos = meses_validos_ano(beneficio, ano)
+    mes = None
+    reconsultar_beneficiarios = False
+    if tipo == "Agregado mensal do ano":
+        modo_meses = st.radio(
+            "Meses do ano",
+            ["Todos os meses", "Selecionar meses"],
+            horizontal=True,
+            key="modo_meses_agregado",
+        )
+        if modo_meses == "Todos os meses":
+            meses_consulta = meses_validos
+        else:
+            meses_consulta = st.multiselect(
+                "Escolha um ou mais meses",
+                options=meses_validos,
+                format_func=lambda valor: f"{valor}/{ano}",
+                key=f"meses_agregado_{beneficio}_{ano}",
+            )
+        periodo = modo_meses
+    else:
+        periodo = st.radio(
+            "Período a adicionar",
+            ["Um mês", "Ano inteiro"],
+            horizontal=True,
+            key="periodo_adicionar_beneficiarios",
+        )
+        if periodo == "Um mês":
+            if meses_validos:
+                mes = st.selectbox(
+                    "Mês",
+                    options=meses_validos,
+                    format_func=lambda valor: f"{valor}/{ano}",
+                    key=f"mes_beneficiario_{beneficio}_{ano}",
+                )
+                meses_consulta = [mes]
+            else:
+                meses_consulta = []
+        else:
+            meses_consulta = meses_validos
+        reconsultar_beneficiarios = st.checkbox(
+            "Reconsultar meses já coletados",
+            key=f"reconsultar_{beneficio}_{ano}",
+            help=(
+                "Atualiza os registros locais com a resposta atual da API. "
+                "Use para preencher os dados do representante legal do BPC "
+                "em meses que foram coletados antes desta melhoria."
+            ),
+        )
+
+if mun:
+    st.header(f"Painel municipal — {mun['nome']}/{mun['uf']}")
+    resumo_programas = pd.read_sql_query(
+        """
+        WITH programas AS (
+            SELECT beneficio FROM beneficio_mensal WHERE codigo_ibge=?
+            UNION
+            SELECT beneficio FROM beneficiario WHERE codigo_ibge=?
+        ),
+        agregados AS (
+            SELECT beneficio, COUNT(DISTINCT mes_ano) AS meses_agregados,
+                   SUM(qtd_beneficiados) AS beneficiados_informados
+            FROM beneficio_mensal
+            WHERE codigo_ibge=?
+            GROUP BY beneficio
+        ),
+        pessoas AS (
+            SELECT beneficio, COUNT(*) AS registros_beneficiarios,
+                   COUNT(DISTINCT mes_ano) AS meses_com_beneficiarios
+            FROM beneficiario
+            WHERE codigo_ibge=?
+            GROUP BY beneficio
+        )
+        SELECT programas.beneficio AS programa,
+               COALESCE(agregados.meses_agregados, 0) AS meses_agregados,
+               COALESCE(agregados.beneficiados_informados, 0)
+                   AS beneficiados_informados,
+               COALESCE(pessoas.registros_beneficiarios, 0)
+                   AS registros_beneficiarios,
+               COALESCE(pessoas.meses_com_beneficiarios, 0)
+                   AS meses_com_beneficiarios
+        FROM programas
+        LEFT JOIN agregados ON agregados.beneficio = programas.beneficio
+        LEFT JOIN pessoas ON pessoas.beneficio = programas.beneficio
+        ORDER BY programas.beneficio
+        """,
+        con,
+        params=(mun["codigo_ibge"], mun["codigo_ibge"],
+                mun["codigo_ibge"], mun["codigo_ibge"]),
+    )
+    if resumo_programas.empty:
+        st.info(
+            "Este município está no catálogo oficial, mas ainda não há dados "
+            "coletados. Selecione um programa e período para iniciar uma coleta."
+        )
+    else:
+        total_registros = int(resumo_programas["registros_beneficiarios"].sum())
+        total_competencias = int(resumo_programas["meses_agregados"].sum())
+        total_beneficiados = int(
+            resumo_programas["beneficiados_informados"].sum())
+        titulares_novo_bf = con.execute(
+            """
+            SELECT COUNT(DISTINCT nis) FROM beneficiario
+            WHERE codigo_ibge=? AND beneficio='Novo Bolsa Familia (sacado)'
+            """,
+            (mun["codigo_ibge"],),
+        ).fetchone()[0]
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Programas com dados", len(resumo_programas))
+        k2.metric("Competências agregadas", total_competencias)
+        k3.metric("Registros de beneficiários", f"{total_registros:,}")
+        k4.metric("Titulares do Novo Bolsa Família", f"{titulares_novo_bf:,}")
+
+        secao_painel = st.radio(
+            "Área do painel",
+            ["Resumo e evolução", "Famílias e beneficiários",
+             "Grafo inteligente"],
+            horizontal=True,
+            key=f"secao_painel_{mun['codigo_ibge']}",
+            label_visibility="collapsed",
+        )
+        if secao_painel == "Resumo e evolução":
+            st.subheader("Cobertura por programa")
+            st.dataframe(resumo_programas, use_container_width=True,
+                         hide_index=True)
+            if total_beneficiados:
+                st.caption(
+                    f"Beneficiados informados nos agregados: "
+                    f"{total_beneficiados:,} (soma das competências)."
+                )
+
+            serie_mensal = pd.read_sql_query(
+                """
+                SELECT mes_ano AS mes, beneficio AS programa,
+                       COUNT(DISTINCT nis) AS beneficiarios,
+                       SUM(COALESCE(valor, 0)) AS valor_pago
+                FROM beneficiario
+                WHERE codigo_ibge=?
+                GROUP BY mes_ano, beneficio
+                ORDER BY mes_ano, beneficio
+                """,
+                con,
+                params=(mun["codigo_ibge"],),
+            )
+            if serie_mensal.empty:
+                st.info(
+                    "Ainda não há séries mensais de beneficiários para exibir."
+                )
+            else:
+                st.subheader("Beneficiários por competência")
+                st.bar_chart(
+                    serie_mensal,
+                    x="mes",
+                    y="beneficiarios",
+                    color="programa",
+                    x_label="Competência",
+                    y_label="Titulares encontrados",
+                )
+                valores = serie_mensal[serie_mensal["valor_pago"] > 0]
+                if not valores.empty:
+                    st.subheader("Valores pagos por competência")
+                    st.line_chart(
+                        valores,
+                        x="mes",
+                        y="valor_pago",
+                        color="programa",
+                        x_label="Competência",
+                        y_label="Valor (R$)",
+                    )
+
+        elif secao_painel == "Famílias e beneficiários":
+            st.subheader("Titulares e benefícios encontrados")
+            st.info(
+                "A API disponibiliza os dados do beneficiário/titular e o NIS, "
+                "mas não a composição completa dos membros da família. "
+                "A tabela agrupa os registros por titular e programa."
+            )
+            programas_locais = resumo_programas["programa"].tolist()
+            opcoes_programa = ["Todos os programas", *programas_locais]
+            programa_padrao = "Novo Bolsa Familia (sacado)"
+            indice_programa = (
+                opcoes_programa.index(programa_padrao)
+                if programa_padrao in opcoes_programa else 0
+            )
+            cf1, cf2 = st.columns([1, 2])
+            with cf1:
+                filtro_programa = st.selectbox(
+                    "Programa dos beneficiários",
+                    opcoes_programa,
+                    index=indice_programa,
+                    key=f"filtro_programa_pessoas_{mun['codigo_ibge']}",
+                )
+            with cf2:
+                busca_pessoa = st.text_input(
+                    "Buscar por nome ou NIS",
+                    key=f"busca_pessoa_{mun['codigo_ibge']}",
+                    placeholder="Digite parte do nome ou do NIS...",
+                )
+
+            filtro_ano = st.selectbox(
+                "Ano das competências",
+                ["Todos os anos", *sorted({
+                    row[0] for row in con.execute(
+                        "SELECT DISTINCT substr(mes_ano,1,4) "
+                        "FROM beneficiario WHERE codigo_ibge=? "
+                        "ORDER BY substr(mes_ano,1,4) DESC",
+                        (mun["codigo_ibge"],),
+                    )
+                }, reverse=True)],
+                key=f"filtro_ano_pessoas_{mun['codigo_ibge']}",
+            )
+            pagina_size = 100
+            pagina_pessoas = st.number_input(
+                "Página de beneficiários",
+                min_value=1,
+                value=1,
+                step=1,
+                key=(
+                    f"pagina_beneficiarios_{mun['codigo_ibge']}_"
+                    f"{filtro_programa}_{filtro_ano}_"
+                    f"{busca_pessoa.strip()}"
+                ),
+            )
+            beneficiarios = pd.read_sql_query(
+                """
+                WITH por_programa AS (
+                    SELECT nis,
+                           beneficio,
+                           MAX(CASE
+                               WHEN nome != '*** TITULAR MENOR DE 16 ANOS ***'
+                               THEN NULLIF(nome, '')
+                           END) AS titular,
+                           MAX(cpf_mascarado) AS cpf,
+                           COUNT(DISTINCT mes_ano) AS meses_encontrados,
+                           COUNT(DISTINCT substr(mes_ano,1,4))
+                               AS anos_encontrados,
+                           SUM(valor) AS valor_total,
+                           MAX(mes_ano) AS ultima_competencia,
+                           MAX(json_extract(
+                               extras, '$.representanteLegal.nome'))
+                               AS representante_nome,
+                           MAX(json_extract(
+                               extras, '$.representanteLegal.nis'))
+                               AS representante_nis,
+                           MAX(json_extract(
+                               extras, '$.representanteLegal.cpf_mascarado'))
+                               AS representante_cpf,
+                           MAX(CASE
+                               WHEN json_extract(extras, '$.menor16anos') = 1
+                                 OR nome =
+                                     '*** TITULAR MENOR DE 16 ANOS ***'
+                               THEN 1 ELSE 0 END) AS beneficiario_menor
+                    FROM beneficiario
+                    WHERE codigo_ibge=?
+                      AND (?='Todos os programas' OR beneficio=?)
+                      AND (?='' OR instr(lower(COALESCE(nome, '')),
+                                           lower(?)) > 0
+                           OR instr(nis, ?) > 0
+                           OR instr(lower(COALESCE(json_extract(
+                               extras, '$.representanteLegal.nome'), '')),
+                               lower(?)) > 0
+                           OR instr(COALESCE(json_extract(
+                               extras, '$.representanteLegal.nis'), ''), ?) > 0)
+                      AND (?='Todos os anos'
+                           OR substr(mes_ano,1,4)=?)
+                    GROUP BY nis, beneficio
+                ),
+                por_pessoa AS (
+                    SELECT nis,
+                           COALESCE(
+                               MAX(titular),
+                               CASE WHEN MAX(beneficiario_menor)=1
+                                   THEN 'Titular menor de 16 anos'
+                                   ELSE 'Titular sem nome informado'
+                               END
+                           ) AS titular,
+                           MAX(cpf) AS cpf,
+                           MAX(beneficiario_menor) AS beneficiario_menor,
+                           MAX(representante_nome) AS representante_nome,
+                           MAX(representante_nis) AS representante_nis,
+                           MAX(representante_cpf) AS representante_cpf,
+                           GROUP_CONCAT(
+                               beneficio || ' (' || meses_encontrados ||
+                               ' mês(es), ' || anos_encontrados ||
+                               ' ano(s))',
+                               '; '
+                           ) AS programas,
+                           SUM(valor_total) AS valor_total,
+                           MAX(ultima_competencia) AS ultima_competencia
+                    FROM por_programa
+                    GROUP BY nis
+                )
+                SELECT por_pessoa.*,
+                       COUNT(*) OVER () AS total_pessoas
+                FROM por_pessoa
+                ORDER BY titular, nis
+                LIMIT ? OFFSET ?
+                """,
+                con,
+                params=(
+                    mun["codigo_ibge"],
+                    filtro_programa, filtro_programa,
+                    busca_pessoa.strip(), busca_pessoa.strip(),
+                    busca_pessoa.strip(), busca_pessoa.strip(),
+                    busca_pessoa.strip(),
+                    filtro_ano, filtro_ano,
+                    pagina_size, (int(pagina_pessoas) - 1) * pagina_size,
+                ),
+            )
+            if beneficiarios.empty:
+                st.info(
+                    "Nenhum beneficiário encontrado com os filtros selecionados."
+                )
+            else:
+                total_pessoas = int(beneficiarios["total_pessoas"].iloc[0])
+                beneficiarios = beneficiarios.drop(columns="total_pessoas")
+                beneficiarios["NIS"] = beneficiarios["nis"].map(
+                    lambda nis: ("Não informado"
+                                 if str(nis).startswith("sem-nis-") else nis)
+                )
+                beneficiarios["Situação"] = beneficiarios[
+                    "beneficiario_menor"].map(
+                        lambda menor: (
+                            "Menor de 16 anos" if menor
+                            else "Não identificado como menor"
+                        )
+                    )
+                beneficiarios["Representante legal"] = beneficiarios.apply(
+                    lambda linha: " — ".join(
+                        str(parte) for parte in (
+                            linha["representante_nome"],
+                            (f'NIS {linha["representante_nis"]}'
+                             if linha["representante_nis"] else None),
+                            (f'CPF {linha["representante_cpf"]}'
+                             if linha["representante_cpf"] else None),
+                        ) if parte
+                    ) or ("Não informado na coleta"
+                          if linha["beneficiario_menor"] else "—"),
+                    axis=1,
+                )
+                beneficiarios["valor_total"] = beneficiarios[
+                    "valor_total"].map(
+                        lambda valor: f"R$ {valor:,.2f}"
+                        if pd.notna(valor) else "—"
+                    )
+                resumo_beneficiarios = beneficiarios.rename(columns={
+                    "titular": "Beneficiário / titular",
+                    "cpf": "CPF mascarado",
+                    "programas": "Programas",
+                    "valor_total": "Total recebido",
+                    "ultima_competencia": "Última competência",
+                })[[
+                    "Beneficiário / titular", "Situação", "NIS",
+                    "CPF mascarado", "Representante legal", "Programas",
+                    "Total recebido", "Última competência",
+                ]]
+                titulo = (
+                    "Beneficiários do Novo Bolsa Família"
+                    if filtro_programa == programa_padrao
+                    else "Beneficiários e titulares"
+                )
+                st.markdown(
+                    f"**{titulo}: {total_pessoas:,} pessoa(s)**"
+                )
+                inicio = (int(pagina_pessoas) - 1) * pagina_size
+                fim = min(inicio + len(resumo_beneficiarios), total_pessoas)
+                st.caption(
+                    f"Mostrando {inicio + 1:,}–{fim:,} de "
+                    f"{total_pessoas:,} pessoa(s)."
+                )
+                st.dataframe(
+                    resumo_beneficiarios,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            st.subheader("Exploração de relações observadas nos dados")
+            st.caption(
+                "Os nós usam NIS como identificador quando disponível. "
+                "Nomes iguais sem NIS coincidente não são tratados como a "
+                "mesma pessoa; nomes e NIS são mascarados no desenho."
+            )
+            modo_grafo = st.radio(
+                "Tipo de rede",
+                ["Programas com beneficiários em comum", "Programas de uma pessoa"],
+                horizontal=True,
+                key=f"modo_grafo_{mun['codigo_ibge']}",
+            )
+            anos_rede = anos_beneficiarios(con, mun["codigo_ibge"])
+            if not anos_rede:
+                opcoes_periodo = ["Sem dados disponíveis"]
+                periodo_selecionado = "Sem dados disponíveis"
+            else:
+                # Allow selection of year range or single year
+                opcoes_periodo = ["Todos os anos"] + [f"{ano} (único)" for ano in anos_rede]
+                # Add some common ranges
+                if len(anos_rede) >= 2:
+                    opcoes_periodo.extend([
+                        f"{anos_rede[0]}-{anos_rede[-1]} (período completo)",
+                        f"{anos_rede[-2]}-{anos_rede[-1]} (últimos 2 anos)",
+                        f"{anos_rede[-3]}-{anos_rede[-1]} (últimos 3 anos)" if len(anos_rede) >= 3 else ""
+                    ])
+                    opcoes_periodo = [p for p in opcoes_periodo if p]  # Remove empty strings
+            
+            periodo_rede = st.selectbox(
+                "Período da rede",
+                opcoes_periodo,
+                key=f"periodo_grafo_{mun['codigo_ibge']}",
+            )
+            
+            # Parse the selected period to get ano_inicio and ano_fim for SQL filtering
+            if periodo_rede == "Todos os anos":
+                ano_inicio, ano_fim = None, None
+            elif periodo_rede == "Sem dados disponível":
+                ano_inicio, ano_fim = None, None
+            elif "(único)" in periodo_rede:
+                ano_selecionado = int(periodo_rede.split()[0])
+                ano_inicio, ano_fim = ano_selecionado, ano_selecionado
+            elif "período completo" in periodo_rede:
+                ano_inicio, ano_fim = anos_rede[0], anos_rede[-1]
+            elif "últimos 2 anos" in periodo_rede:
+                ano_inicio, ano_fim = anos_rede[-2], anos_rede[-1]
+            elif "últimos 3 anos" in periodo_rede and len(anos_rede) >= 3:
+                ano_inicio, ano_fim = anos_rede[-3], anos_rede[-1]
+            else:
+                # Fallback to single year parsing
+                try:
+                    ano_selecionado = int(periodo_rede.split()[0])
+                    ano_inicio, ano_fim = ano_selecionado, ano_selecionado
+                except:
+                    ano_inicio, ano_fim = None, None
+
+            if modo_grafo == "Programas com beneficiários em comum":
+                rede_programas = criar_grafo_programas(
+                    con, mun["codigo_ibge"], anoInicio, ano_fim)
+                pesos = [
+                    dados["peso"]
+                    for _, _, dados in rede_programas.edges(data=True)
+                ]
+                if not pesos:
+                    st.info(
+                        "Os dados disponíveis não mostram o mesmo NIS em "
+                        "mais de um programa neste período. Os programas "
+                        "serão exibidos sem ligações inferidas."
+                    )
+                    minimo_compartilhados = 1
+                else:
+                    minimo_compartilhados = st.slider(
+                        "Mínimo de beneficiários em comum para mostrar uma ligação",
+                        min_value=1,
+                        max_value=max(pesos),
+                        value=1,
+                        key=f"limite_aresta_grafo_{mun['codigo_ibge']}",
+                    )
+                    remover = [
+                        (origem, destino)
+                        for origem, destino, dados
+                        in rede_programas.edges(data=True)
+                        if dados["peso"] < minimo_compartilhados
+                    ]
+                    rede_programas.remove_edges_from(remover)
+
+                n_programas = rede_programas.number_of_nodes()
+                n_ligacoes = rede_programas.number_of_edges()
+                pessoas_em_comum = sum(
+                    dados["peso"]
+                    for _, _, dados in rede_programas.edges(data=True)
+                )
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Programas", n_programas)
+                m2.metric("Pares de programas ligados", n_ligacoes)
+                m3.metric("Ocorrências de NIS em comum", pessoas_em_comum)
+                if n_programas:
+                    nodes, edges = nx_to_agraph(rede_programas)
+                    config = Config(
+                        width="100%",
+                        height=500,
+                        directed=False,
+                        physics=True,
+                        hierarchical=False,
+                        # Node styling
+                        nodeHighlightBehavior=True,
+                        highlightColor="#F7A7A6",
+                        # Collapsible
+                        collapsible=True,
+                        # Node size and label properties
+                        node={"labelProperty": "label"},
+                        link={"labelProperty": "label", "renderLabel": True}
+                    )
+                    
+                    # Display metrics
+                    metricas = calcular_metricas_grafo(rede_programas)
+                    metricas_formatadas = format_metricas_para_exibicao(metricas, "programas")
+                    
+                    # Create columns for metrics and graph
+                    met_col, graph_col = st.columns([1, 2])
+                    
+                    with met_col:
+                        st.subheader("Métricas da Rede")
+                        for label, value in metricas_formatadas:
+                            st.metric(label, value)
+                    
+                    with graph_col:
+                        agraph(nodes=nodes, edges=edges, config=config)
+            else:
+                termo_rede = st.text_input(
+                    "Buscar pessoa por nome ou NIS",
+                    key=f"busca_pessoa_grafo_{mun['codigo_ibge']}",
+                    placeholder="Digite pelo menos dois caracteres...",
+                )
+                if len(termo_rede.strip()) < 2:
+                    st.info(
+                        "Digite pelo menos dois caracteres para procurar "
+                        "beneficiários."
+                    )
+                else:
+                    candidatos = buscar_pessoas(
+                        con, mun["codigo_ibge"], termo_rede,
+                        anoInicio=anoInicio, ano_fim=ano_fim)
+                    if not candidatos:
+                        st.info("Nenhuma pessoa encontrada para essa busca.")
+                    else:
+                        opcoes_pessoas = {
+                            pessoa[0]: (
+                                f'{pessoa[1] or ("Titular menor de 16 anos" if pessoa[2] else "Titular sem nome informado")} '
+                                f'({mascarar_nis(pessoa[0])}; '
+                                f'{pessoa[3]} programa(s))'
+                            )
+                            for pessoa in candidatos
+                        }
+                        nis_selecionado = st.selectbox(
+                            "Selecione uma pessoa",
+                            options=list(opcoes_pessoas),
+                            format_func=lambda nis: opcoes_pessoas[nis],
+                            key=(
+                                f"pessoa_grafo_{mun['codigo_ibge']}_"
+                                f"{termo_rede.strip()}"
+                            ),
+                        )
+                        if len(candidatos) == 100:
+                            st.caption(
+                                "Exibindo até 100 correspondências; "
+                                "refine a busca para localizar outros nomes."
+                            )
+                        incluir_vizinhos = st.checkbox(
+                            "Mostrar outras pessoas com programas em comum",
+                            key=(
+                                f"vizinhos_grafo_{mun['codigo_ibge']}_"
+                                f"{nis_selecionado}"
+                            ),
+                            help=(
+                                "Uma ligação por programa em comum não "
+                                "significa parentesco nem residência conjunta."
+                            ),
+                        )
+                        dados_pessoa = programas_da_pessoa(
+                            con, mun["codigo_ibge"], nis_selecionado, ano_fim)
+                        programas_pessoa = [row[0] for row in dados_pessoa]
+                        vizinhos = (
+                            vizinhos_por_programas(
+                                con, mun["codigo_ibge"], nis_selecionado,
+                                programas_pessoa, ano_fim)
+                            if incluir_vizinhos else []
+                        )
+                        rede_pessoa = criar_grafo_pessoa(
+                            nis_selecionado,
+                            dados_pessoa,
+                            vizinhos,
+                            nome_pessoa=next(
+                                (
+                                    pessoa[1] for pessoa in candidatos
+                                    if pessoa[0] == nis_selecionado
+                                ),
+                                None,
+                            ),
+                        )
+                        foco = next(
+                            (no for no, dados
+                             in rede_pessoa.nodes(data=True)
+                             if dados["tipo"] == "pessoa"),
+                            None,
+                        )
+                        grau = (
+                            rede_pessoa.degree(foco)
+                            if foco is not None else 0
+                        )
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Programas encontrados", len(programas_pessoa))
+                        m2.metric("Relações no grafo", rede_pessoa.number_of_edges())
+                        m3.metric("Programas ligados à pessoa", grau)
+                        if rede_pessoa.number_of_nodes():
+                            nodes, edges = nx_to_agraph(rede_pessoa)
+                            config = Config(
+                                width=800,
+                                height=650,
+                                directed=False,
+                                physics=True,
+                                hierarchical=False,
+                                # Node styling
+                                nodeHighlightBehavior=True,
+                                highlightColor="#F7A7A6",
+                                # Collapsible
+                                collapsible=True,
+                                # Node size and label properties
+                                node={"labelProperty": "label"},
+                                link={"labelProperty": "label", "renderLabel": True}
+                            )
+                            
+                            agraph(nodes=nodes, edges=edges, config=config)
+                            
+                            # Display metrics
+                            metricas = calcular_metricas_grafo(rede_pessoa)
+                            metricas_formatadas = format_metricas_para_exibicao(metricas, "pessoa")
+                            
+                            # Create columns for metrics and graph
+                            met_col, graph_col = st.columns([1, 2])
+                            
+                            with met_col:
+                                st.subheader("Métricas da Rede")
+                                for label, value in metricas_formatadas:
+                                    st.metric(label, value)
+                            
+                            with graph_col:
+                                agraph(nodes=nodes, edges=edges, config=config)
+                        st.caption(
+                            "As ligações representam registros nos programas. "
+                            "Não constituem prova de parentesco, vínculo "
+                            "familiar ou residência conjunta."
+                        )
+
+# ------------------------------------------------- logica inteligente ----
+
+
+def buscar_agregado(meses_consulta, forcar=False):
+    """Valida a vigência e retorna agregados do banco ou da API."""
+    if not meses_validos:
+        return {"erro": (f"O {beneficio} nao existiu em {ano}. "
+                         f"Vigencia: {fmt_mes(ini)} a "
+                         f"{fmt_mes(fim) if fim else 'atual'}.")}
+    if not meses_consulta:
+        return {"erro": "Selecione pelo menos um mês válido para consultar."}
+    faltantes = meses_agregado_faltantes(con, beneficio, ano,
+                                         mun["codigo_ibge"], meses_consulta)
+    if not faltantes and not forcar:
+        df = _df_agregado(meses_consulta)
+        return {"df": df, "origem": "banco", "meses": meses_consulta}
+    if not chave:
+        return {"erro": "Informe a chave da API na barra lateral."}
+    client = PortalClient(chave)
+    barra = st.progress(0.0)
+    status = st.empty()
+
+    def _on_mes(mes_ano, n, ms):
+        """Atualiza o progresso e o tempo do mês consultado."""
+        i = meses_consulta.index(mes_ano[-2:]) + 1
+        barra.progress(i / len(meses_consulta))
+        status.text(f"{mes_ano}: {n} registro(s) em {ms:.0f} ms")
+
+    stats = coletar_agregado_ano(client, con, beneficio, ano,
+                                 mun["codigo_ibge"], mun["nome"], mun["uf"],
+                                 meses=faltantes or meses_consulta,
+                                 on_mes=_on_mes)
+    barra.progress(1.0)
+    status.text("")
+    df = _df_agregado(meses_consulta)
+    return {"df": df, "origem": "api", "meses": meses_consulta,
+            "stats": stats}
+
+
+def adicionar_beneficiarios(meses_consulta, reconsultar=False):
+    """Coleta e salva os meses de beneficiários ainda ausentes do banco."""
+    if not meses_consulta:
+        return {"erro": "Nao ha meses validos para adicionar neste periodo."}
+    faltantes = meses_beneficiarios_faltantes(
+        con, beneficio, ano, mun["codigo_ibge"], meses_consulta)
+    meses_existentes = len(meses_consulta) - len(faltantes)
+    meses_coletar = meses_consulta if reconsultar else faltantes
+    if not meses_coletar:
+        return {
+            "origem": "banco",
+            "meses_adicionados": 0,
+            "meses_atualizados": 0,
+            "registros": 0,
+            "meses_existentes": meses_existentes,
+        }
+    if not chave:
+        return {"erro": "Informe a chave da API na barra lateral."}
+    client = PortalClient(chave)
+    barra = st.progress(0.0)
+    status = st.empty()
+    registros = 0
+    for indice, mes_consulta in enumerate(meses_coletar, start=1):
+        mes_ano = f"{ano}{mes_consulta}"
+        status.text(f"Adicionando {beneficio}: {mes_ano}")
+
+        def _on_pagina(pagina, quantidade, tempo_ms):
+            """Exibe o progresso da paginação do mês em coleta."""
+            status.text(
+                f"{mes_ano} - página {pagina}: {quantidade} registro(s), "
+                f"{tempo_ms:.0f} ms"
+            )
+
+        stats = coletar_beneficiarios(
+            client, con, beneficio, mes_ano,
+            mun["codigo_ibge"], mun["nome"], mun["uf"],
+            on_pagina=_on_pagina,
+        )
+        registros += stats["registros"]
+        barra.progress(indice / len(meses_coletar))
+    barra.progress(1.0)
+    status.text("")
+    return {
+        "origem": "api",
+        "meses_adicionados": (
+            0 if reconsultar else len(meses_coletar)),
+        "meses_atualizados": (
+            len(meses_coletar) if reconsultar else 0),
+        "registros": registros,
+        "meses_existentes": meses_existentes,
+    }
+
+
+def _df_agregado(meses_consulta):
+    """Carrega do SQLite os agregados dos meses selecionados."""
+    placeholders = ",".join("?" for _ in meses_consulta)
+    return pd.read_sql_query(
+        "SELECT mes_ano AS mes, valor, qtd_beneficiados AS beneficiados "
+        "FROM beneficio_mensal WHERE beneficio=? AND substr(mes_ano,1,4)=? "
+        f"AND substr(mes_ano,5,2) IN ({placeholders}) AND codigo_ibge=? "
+        "ORDER BY mes_ano",
+        con,
+        params=(beneficio, str(ano), *meses_consulta, mun["codigo_ibge"]),
+    )
+
+
+def nx_to_agraph(graph):
+    """Convert a NetworkX graph to nodes and edges for streamlit-agraph."""
+    nodes = []
+    for node_id, node_data in graph.nodes(data=True):
+        nodes.append(Node(
+            id=str(node_id),
+            label=node_data.get("label", str(node_id)),
+            size=25
+        ))
+
+    edges = []
+    for source, target, edge_data in graph.edges(data=True):
+        edges.append(Edge(
+            source=str(source),
+            target=str(target),
+            label=edge_data.get("label", "")
+        ))
+
+    return nodes, edges
+
+
+rotulo_botao = ("Buscar agregado" if tipo == "Agregado mensal do ano"
+                else "Adicionar dados do programa")
+if st.button(rotulo_botao, type="primary", key="buscar"):
+    if not mun:
+        st.warning("Selecione um município para realizar a busca.")
+    else:
+        resultado = (buscar_agregado(meses_consulta)
+                     if tipo == "Agregado mensal do ano"
+                     else adicionar_beneficiarios(
+                         meses_consulta, reconsultar_beneficiarios))
+        resultado.update({
+            "codigo_ibge": mun["codigo_ibge"],
+            "beneficio": beneficio,
+            "tipo": tipo,
+            "ano": int(ano),
+            "periodo": periodo,
+            "meses_consulta": tuple(meses_consulta),
+            "reconsultar_beneficiarios": reconsultar_beneficiarios,
+        })
+        st.session_state.resultado = resultado
+
+# ---------------------------------------------------------- resultados ----
+r = st.session_state.get("resultado")
+if r and mun and all((
+        r.get("codigo_ibge") == mun["codigo_ibge"],
+        r.get("beneficio") == beneficio,
+        r.get("tipo") == tipo,
+        r.get("ano") == int(ano),
+        r.get("periodo") == periodo,
+        r.get("meses_consulta") == tuple(meses_consulta),
+        r.get("reconsultar_beneficiarios")
+        == reconsultar_beneficiarios,
+)):
+    if r.get("erro"):
+        st.error(r["erro"])
+    elif tipo == "Adicionar beneficiários":
+        if r["origem"] == "banco":
+            st.info(
+                f"Os {r['meses_existentes']} mês(es) selecionado(s) já "
+                "estavam incluídos no banco."
+            )
+        else:
+            st.success(
+                (
+                    f"Atualização concluída: {r['meses_atualizados']} mês(es) "
+                    f"reconsultado(s), {r['registros']:,} registro(s) "
+                    "atualizado(s)."
+                    if reconsultar_beneficiarios
+                    else f"Adição concluída: {r['meses_adicionados']} mês(es) "
+                    f"consultado(s), {r['registros']:,} registro(s) de "
+                    f"beneficiário incluído(s). {r['meses_existentes']} "
+                    "mês(es) já estavam no banco."
+                )
+            )
+    else:
+        st.divider()
+        origem = "dados salvos no banco" if r["origem"] == "banco" \
+            else "dados buscados agora na API"
+        st.caption(f"{beneficio} - {mun['nome']}/{mun['uf']} ({origem})")
+        if r["origem"] == "banco" and st.button("Atualizar da API"):
+            resultado = buscar_agregado(list(meses_consulta), forcar=True)
+            resultado.update({
+                "codigo_ibge": mun["codigo_ibge"],
+                "beneficio": beneficio,
+                "tipo": tipo,
+                "ano": int(ano),
+                "periodo": periodo,
+                "meses_consulta": tuple(meses_consulta),
+            })
+            st.session_state.resultado = resultado
+            st.rerun()
+
+        df = r["df"]
+        if df.empty:
+            st.info("Nenhum dado encontrado para esse filtro.")
+        elif tipo == "Agregado mensal do ano":
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Meses com dados", len(df))
+            k2.metric("Valor total", f"R$ {df['valor'].sum():,.2f}")
+            k3.metric("Beneficiados (soma mensal)",
+                      f"{int(df['beneficiados'].sum()):,}")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Valor por mes (R$)")
+                st.line_chart(df.set_index("mes")["valor"])
+            with c2:
+                st.subheader("Beneficiados por mes")
+                st.bar_chart(df.set_index("mes")["beneficiados"])
+            st.dataframe(df, use_container_width=True)
+            st.download_button("Baixar CSV",
+                               df.to_csv(index=False).encode("utf-8"),
+                               f"{beneficio}_{ano}_{mun['codigo_ibge']}.csv",
+                               "text/csv")
